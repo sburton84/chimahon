@@ -8,6 +8,7 @@ import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -1301,7 +1302,10 @@ private class ReaderAndroidWebView(
                 touchStartY = event.y
             }
             MotionEvent.ACTION_UP -> {
-                if (totalMovement < 20f) {
+                // A long press starts native text selection; treating its release as a tap
+                // would turn the page or toggle the HUD at the edges and dismiss the menu.
+                val isLongPress = event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout()
+                if (totalMovement < 20f && !isLongPress) {
                     val cssX = event.x / resources.displayMetrics.density
                     val cssY = event.y / resources.displayMetrics.density
                     evaluateJavascript(
