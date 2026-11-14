@@ -346,13 +346,35 @@ fun ReaderScreen(
 
                     val einkRefreshHost = remember { EinkRefreshHost() }
 
+                    val webViewModifier = Modifier.fillMaxWidth().then(heightModifier)
+                    val liveReaderSettings = viewModel.getReaderSettings(context)
+                    var webViewSizePx by remember { mutableStateOf(IntSize.Zero) }
+                    val pageLayoutKey = PageLayoutKey.of(
+                        settings = liveReaderSettings,
+                        continuousMode = viewModel.continuousMode,
+                        widthPx = webViewSizePx.width,
+                        heightPx = webViewSizePx.height,
+                    )
+                    LaunchedEffect(pageLayoutKey) {
+                        viewModel.updatePageLayout(pageLayoutKey)
+                    }
+
+                    // Hidden exact page counter (opt-in), beneath the visible reader.
+                    if (pageLayoutKey != null && viewModel.needsExactPageCount) {
+                        ReaderPageCounter(
+                            modifier = webViewModifier,
+                            viewModel = viewModel,
+                            layout = pageLayoutKey,
+                        )
+                    }
+
                     // Single WebView handles all chapters
                     ReaderWebView(
-                        modifier = Modifier.fillMaxWidth().then(heightModifier),
+                        modifier = webViewModifier.onSizeChanged { webViewSizePx = it },
                         bridge = viewModel.bridge,
                         continuousMode = viewModel.continuousMode,
                         isImageOnly = viewModel.isCurrentChapterImageOnly,
-                        readerSettings = viewModel.getReaderSettings(context),
+                        readerSettings = liveReaderSettings,
                         focusMode = focusMode,
                         onNextChapter = {
                             viewModel.onChapterEdge(NovelTurnDirection.NEXT)
@@ -379,6 +401,7 @@ fun ReaderScreen(
                         },
                         onScrollMoved = { if (viewModel.einkRefreshOnScroll) einkRefreshHost.triggerScroll() },
                         onImageTapped = { uri -> tappedImageUri = uri },
+                        onPageInfoChanged = viewModel::onSectionPageInfo,
                     )
 
                     if (viewModel.einkRefreshOnPageTurn || viewModel.einkRefreshOnScroll) {
@@ -459,7 +482,7 @@ fun ReaderScreen(
             ) {
                 ReaderBottomBar(
                     focusMode = focusMode,
-                    progressText = "${(readyVm.currentProgress * 100).toInt()}%",
+                    progressText = readyVm.progressDisplayText,
                     backgroundColor = currentSettings.backgroundColor,
                     contentColor = currentSettings.textColor,
                     onToggleHud = { onShowHudChanged(false) },

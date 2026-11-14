@@ -308,6 +308,31 @@ window.hoshiReader = {
         return totalChars > 0 ? exploredChars / totalChars : 0;
     },
 
+    // Screen pages of the loaded section: { page: 1-based current, total }.
+    // Paged mode counts the same page steps paginate() moves through; continuous
+    // mode counts viewport-sized screens along the scroll axis.
+    getPageInfo: function() {
+        var total, page;
+        if (!this.continuousMode) {
+            var context = this.getScrollContext();
+            var steps = context.maxScroll > 1 ? Math.ceil((context.maxScroll - 1) / context.pageSize) : 0;
+            total = steps + 1;
+            var pos = this.getPagePosition(context);
+            page = pos >= context.maxScroll - 1 ? total : Math.round(pos / context.pageSize) + 1;
+        } else {
+            var el = document.scrollingElement || document.documentElement;
+            var vOver = el.scrollHeight - window.innerHeight > 1;
+            var screen = Math.max(1, vOver ? window.innerHeight : window.innerWidth);
+            var size = vOver ? el.scrollHeight : el.scrollWidth;
+            var maxPos = Math.max(0, size - screen);
+            var cur = Math.abs(vOver ? window.scrollY : window.scrollX);
+            total = Math.max(1, Math.ceil((size - 1) / screen));
+            page = cur >= maxPos - 2 ? total : Math.floor(cur / screen) + 1;
+        }
+        page = Math.min(Math.max(1, page), total);
+        return JSON.stringify({ page: page, total: total });
+    },
+
     restoreProgress: async function(progress, isRtl) {
         this.isRtl = !!isRtl;
         var p = Math.min(1, Math.max(0, progress));

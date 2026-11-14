@@ -19,16 +19,21 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.common.io.Files.append
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
+import kotlin.coroutines.resume
 
 @Composable
 fun ReaderWebView(
@@ -56,6 +61,7 @@ fun ReaderWebView(
     onPageTurned: () -> Unit = {},
     onScrollMoved: () -> Unit = {},
     onImageTapped: (imageUrl: String) -> Unit = {},
+    onPageInfoChanged: (page: Int, total: Int) -> Unit = { _, _ -> },
 ) {
     val pendingCommands = remember(bridge) { bridge.pendingCommands }
 
@@ -116,133 +122,10 @@ fun ReaderWebView(
                 onPageTurned = onPageTurned,
                 onScrollMoved = onScrollMoved,
                 onImageTappedCallback = onImageTapped,
+                onPageInfoChanged = onPageInfoChanged,
             ).apply {
                 setSelectionRectsCallback(onSelectionRectsReceived)
-                settings.allowFileAccess = true
-                settings.allowContentAccess = true
-                settings.allowFileAccessFromFileURLs = true
-                settings.allowUniversalAccessFromFileURLs = true
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                settings.builtInZoomControls = false
-                settings.displayZoomControls = false
-                settings.loadWithOverviewMode = false
-                settings.useWideViewPort = true
-                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                isVerticalScrollBarEnabled = false
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = WebView.OVER_SCROLL_NEVER
-                webChromeClient = object : WebChromeClient() {
-                    override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                        Log.d("HoshiReader", "${message.message()} [line ${message.lineNumber()}]")
-                        return true
-                    }
-                }
-                webViewClient = object : WebViewClient() {
-
-                    override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                    ): WebResourceResponse? {
-                        val resourceRequest = request ?: return null
-                        if (!resourceRequest.method.equals("GET", ignoreCase = true)) return null
-
-                        val uri = resourceRequest.url
-                        if (uri.scheme != "file" || !uri.path.orEmpty().endsWith(".css", ignoreCase = true)) {
-                            return null
-                        }
-
-                        val cssFile = File(uri.path ?: return null)
-                        if (!cssFile.isFile) return null
-
-                        return runCatching {
-                            val sanitized = sanitizeReaderResource("text/css", cssFile.readBytes())
-                            WebResourceResponse(
-                                "text/css",
-                                "UTF-8",
-                                sanitized.inputStream(),
-                            )
-                        }.onFailure {
-                            Log.w("ReaderWebView", "Failed to sanitize stylesheet ${cssFile.name}", it)
-                        }.getOrNull()
-                    }
-
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                    ): Boolean {
-                        val url = request?.url?.toString() ?: return false
-                        val currentFile = currentUrl
-                            ?.removePrefix("file://")
-                            ?.substringBefore("#")
-                        val targetFile = url
-                            .removePrefix("file://")
-                            .substringBefore("#")
-                        val fragment = url.substringAfter("#", missingDelimiterValue = "")
-
-                        Log.d("ReaderWebView", "shouldOverrideUrlLoading: url=$url currentFile=$currentFile targetFile=$targetFile fragment=$fragment")
-
-                        if (currentFile != null && currentFile == targetFile) {
-                            // Same chapter file – just scroll to the fragment via JS (no reload)
-                            if (fragment.isNotEmpty()) {
-                                val escapedId = fragment.replace("\\", "\\\\").replace("'", "\\'")
-                                val js = """
-                                    (function() {
-                                        var el = document.getElementById('$escapedId')
-                                            || document.querySelector('[name="$escapedId"]');
-                                        if (el) el.scrollIntoView({ behavior: 'instant', block: 'start' });
-                                    })();
-                                """.trimIndent()
-                                post { evaluateJavascript(js, null) }
-                            }
-                            return true // always intercept – no full reload
-                        }
-
-                        // Different chapter file (or external URL) – hand off to ViewModel
-                        post { onInternalLinkClicked(url) }
-                        return true
-                    }
-
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        Log.d("ReaderWebView", "onPageStarted: url=$url")
-                        alpha = 0f
-                        visibility = View.VISIBLE
-                        lastLoadedUrl = null
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        Log.d("ReaderWebView", "onPageFinished: url=$url, size=${view?.width}x${view?.height}")
-                        injectReader()
-                    }
-
-                    override fun onRenderProcessGone(
-                        view: WebView?,
-                        detail: android.webkit.RenderProcessGoneDetail?,
-                    ): Boolean {
-                        val reason = if (detail?.didCrash() == true) {
-                            "WebView crashed"
-                        } else {
-                            "WebView killed by system (OOM)"
-                        }
-                        Log.e("ReaderWebView", "onRenderProcessGone: $reason")
-                        post {
-                            onLoadFailed("Renderer died ($reason). Try disabling hardware acceleration or 'Avoid page breaks'.")
-                        }
-                        return true
-                    }
-
-                    override fun onReceivedError(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                        error: WebResourceError?,
-                    ) {
-                        Log.e("ReaderWebView", "onReceivedError: url=${request?.url}, error=$error")
-                        if (request?.isForMainFrame == true) {
-                            onLoadFailed(error?.description?.toString() ?: "Failed to load chapter")
-                        }
-                    }
-                }
+                installReaderClients(onInternalLinkClicked, onLoadFailed)
             }
         },
         update = { androidWebView ->
@@ -304,6 +187,7 @@ fun ReaderWebView(
                             v.injectReader()
                         } else {
                             v.applySettings(new)
+                            v.postDelayed({ v.reportPageInfo() }, 300L)
                         }
                     }
                     is WebViewCommand.ChangeFocusMode -> {
@@ -349,6 +233,242 @@ fun ReaderWebView(
     )
 }
 
+/**
+ * Hidden WebView that lays out each section with the reader's exact layout
+ * and reports how many pages it takes. It gets the same modifier (so the same
+ * pixel size) as the visible reader, sits beneath it at alpha 0, ignores
+ * touches, and only exists while the ViewModel still needs counts.
+ *
+ * Both WebViews share one renderer thread, so sections are only counted
+ * while the reader is idle (see [ReaderViewModel.awaitReaderIdle]).
+ */
+@Composable
+fun ReaderPageCounter(
+    modifier: Modifier,
+    viewModel: ReaderViewModel,
+    layout: PageLayoutKey,
+) {
+    var counterView by remember { mutableStateOf<ReaderAndroidWebView?>(null) }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            ReaderAndroidWebView(
+                context = context,
+                readerJs = loadAssetText(context, "novel/reader.js"),
+                continuousMode = layout.continuousMode,
+                readerSettings = layout.settings,
+                onNextChapter = { false },
+                onPreviousChapter = { false },
+                onProgressChanged = {},
+                onLoadFailed = {},
+                isPageCounter = true,
+            ).apply {
+                val view = this
+                installReaderClients(
+                    onInternalLinkClicked = {},
+                    onLoadFailed = { view.onLayoutFailed?.invoke() },
+                )
+                alpha = 0f
+                isFocusable = false
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                counterView = view
+            }
+        },
+        onRelease = { it.destroy() },
+    )
+
+    val view = counterView ?: return
+    LaunchedEffect(view, layout) {
+        while (true) {
+            viewModel.awaitReaderIdle()
+            if (viewModel.pageLayoutKey != layout) return@LaunchedEffect
+            // Counts are only valid at the visible reader's exact size.
+            if (view.width != layout.widthPx || view.height != layout.heightPx) {
+                delay(500)
+                continue
+            }
+            val section = viewModel.nextSectionToCount() ?: return@LaunchedEffect
+            val pages = if (viewModel.isPageCountSectionImageOnly(section)) {
+                1
+            } else {
+                countSectionPages(view, layout, viewModel.pageCountSource(section))
+            }
+            viewModel.onSectionCounted(layout, section, pages)
+            delay(50)
+        }
+    }
+}
+
+private suspend fun countSectionPages(
+    view: ReaderAndroidWebView,
+    layout: PageLayoutKey,
+    source: Pair<String, String>?,
+): Int? {
+    val (url, html) = source ?: return null
+    return withTimeoutOrNull(SECTION_COUNT_TIMEOUT_MS) {
+        suspendCancellableCoroutine { cont ->
+            fun finish(pages: Int?) {
+                view.onLayoutReady = null
+                view.onLayoutFailed = null
+                if (cont.isActive) cont.resume(pages)
+            }
+            view.onLayoutReady = { view.reportPageInfo { _, total -> finish(total) } }
+            view.onLayoutFailed = { finish(null) }
+            cont.invokeOnCancellation {
+                view.post {
+                    view.onLayoutReady = null
+                    view.onLayoutFailed = null
+                }
+            }
+            view.readerSettings = layout.settings
+            view.continuousMode = layout.continuousMode
+            view.isImageOnly = false
+            view.pendingProgress = 0.0
+            view.lastLoadedUrl = null
+            view.awaitingInject = true
+            view.loadChapterHtml(url, html)
+        }
+    }
+}
+
+private const val SECTION_COUNT_TIMEOUT_MS = 20_000L
+
+/**
+ * WebView settings and clients shared by the visible reader and the hidden
+ * page counter, so both load and style sections identically.
+ */
+private fun ReaderAndroidWebView.installReaderClients(
+    onInternalLinkClicked: (url: String) -> Unit,
+    onLoadFailed: (String) -> Unit,
+) {
+    settings.allowFileAccess = true
+    settings.allowContentAccess = true
+    settings.allowFileAccessFromFileURLs = true
+    settings.allowUniversalAccessFromFileURLs = true
+    settings.javaScriptEnabled = true
+    settings.domStorageEnabled = true
+    settings.cacheMode = WebSettings.LOAD_NO_CACHE
+    settings.builtInZoomControls = false
+    settings.displayZoomControls = false
+    settings.loadWithOverviewMode = false
+    settings.useWideViewPort = true
+    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+    isVerticalScrollBarEnabled = false
+    isHorizontalScrollBarEnabled = false
+    overScrollMode = WebView.OVER_SCROLL_NEVER
+    webChromeClient = object : WebChromeClient() {
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            Log.d("HoshiReader", "${message.message()} [line ${message.lineNumber()}]")
+            return true
+        }
+    }
+    webViewClient = object : WebViewClient() {
+
+        override fun shouldInterceptRequest(
+            view: WebView?,
+            request: WebResourceRequest?,
+        ): WebResourceResponse? {
+            val resourceRequest = request ?: return null
+            if (!resourceRequest.method.equals("GET", ignoreCase = true)) return null
+
+            val uri = resourceRequest.url
+            if (uri.scheme != "file" || !uri.path.orEmpty().endsWith(".css", ignoreCase = true)) {
+                return null
+            }
+
+            val cssFile = File(uri.path ?: return null)
+            if (!cssFile.isFile) return null
+
+            return runCatching {
+                val sanitized = sanitizeReaderResource("text/css", cssFile.readBytes())
+                WebResourceResponse(
+                    "text/css",
+                    "UTF-8",
+                    sanitized.inputStream(),
+                )
+            }.onFailure {
+                Log.w("ReaderWebView", "Failed to sanitize stylesheet ${cssFile.name}", it)
+            }.getOrNull()
+        }
+
+        override fun shouldOverrideUrlLoading(
+            view: WebView?,
+            request: WebResourceRequest?,
+        ): Boolean {
+            val url = request?.url?.toString() ?: return false
+            val currentFile = currentUrl
+                ?.removePrefix("file://")
+                ?.substringBefore("#")
+            val targetFile = url
+                .removePrefix("file://")
+                .substringBefore("#")
+            val fragment = url.substringAfter("#", missingDelimiterValue = "")
+
+            Log.d("ReaderWebView", "shouldOverrideUrlLoading: url=$url currentFile=$currentFile targetFile=$targetFile fragment=$fragment")
+
+            if (currentFile != null && currentFile == targetFile) {
+                // Same chapter file – just scroll to the fragment via JS (no reload)
+                if (fragment.isNotEmpty()) {
+                    val escapedId = fragment.replace("\\", "\\\\").replace("'", "\\'")
+                    val js = """
+                        (function() {
+                            var el = document.getElementById('$escapedId')
+                                || document.querySelector('[name="$escapedId"]');
+                            if (el) el.scrollIntoView({ behavior: 'instant', block: 'start' });
+                        })();
+                    """.trimIndent()
+                    post { evaluateJavascript(js, null) }
+                }
+                return true // always intercept – no full reload
+            }
+
+            // Different chapter file (or external URL) – hand off to ViewModel
+            post { onInternalLinkClicked(url) }
+            return true
+        }
+
+        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+            Log.d("ReaderWebView", "onPageStarted: url=$url")
+            alpha = 0f
+            visibility = View.VISIBLE
+            lastLoadedUrl = null
+        }
+
+        override fun onPageFinished(view: WebView?, url: String?) {
+            Log.d("ReaderWebView", "onPageFinished: url=$url, size=${view?.width}x${view?.height}")
+            injectReader()
+        }
+
+        override fun onRenderProcessGone(
+            view: WebView?,
+            detail: android.webkit.RenderProcessGoneDetail?,
+        ): Boolean {
+            val reason = if (detail?.didCrash() == true) {
+                "WebView crashed"
+            } else {
+                "WebView killed by system (OOM)"
+            }
+            Log.e("ReaderWebView", "onRenderProcessGone: $reason")
+            post {
+                onLoadFailed("Renderer died ($reason). Try disabling hardware acceleration or 'Avoid page breaks'.")
+            }
+            return true
+        }
+
+        override fun onReceivedError(
+            view: WebView?,
+            request: WebResourceRequest?,
+            error: WebResourceError?,
+        ) {
+            Log.e("ReaderWebView", "onReceivedError: url=${request?.url}, error=$error")
+            if (request?.isForMainFrame == true) {
+                onLoadFailed(error?.description?.toString() ?: "Failed to load chapter")
+            }
+        }
+    }
+}
+
 private class ReaderAndroidWebView(
     context: Context,
     private val readerJs: String,
@@ -373,7 +493,17 @@ private class ReaderAndroidWebView(
     private val onPageTurned: () -> Unit = {},
     private val onScrollMoved: () -> Unit = {},
     private val onImageTappedCallback: (imageUrl: String) -> Unit = {},
+    private val onPageInfoChanged: (page: Int, total: Int) -> Unit = { _, _ -> },
+    /** Hidden layout-only instance: never shown, never takes touches. */
+    val isPageCounter: Boolean = false,
 ) : WebView(context) {
+
+    /** Page-counter hooks (UI thread): section laid out and restored, or failed to load. */
+    var onLayoutReady: (() -> Unit)? = null
+    var onLayoutFailed: (() -> Unit)? = null
+
+    /** Set before a counter load; cleared on inject so stale restores from the previous page are ignored. */
+    var awaitingInject: Boolean = false
 
     private var touchStartX = 0f
     private var touchStartY = 0f
@@ -399,6 +529,22 @@ private class ReaderAndroidWebView(
                     onProgressChanged(it)
                 }
             }
+            reportPageInfo()
+        }
+    }
+
+    /** Reads the section's screen pages and forwards them to [callback] (or [onPageInfoChanged]). */
+    fun reportPageInfo(callback: ((page: Int, total: Int) -> Unit)? = null) {
+        val target = callback ?: onPageInfoChanged
+        if (isImageOnly) {
+            target(1, 1)
+            return
+        }
+        evaluateJavascript(
+            "(function() { try { return window.hoshiReader.getPageInfo(); } catch (e) { return null; } })()",
+        ) { result ->
+            val info = parsePageInfo(result) ?: return@evaluateJavascript
+            target(info.first, info.second)
         }
     }
 
@@ -465,7 +611,12 @@ private class ReaderAndroidWebView(
     private val jsBridge = ReaderJavascriptBridge(
         onRestoreCompleted = { epoch ->
             post {
+                if (isPageCounter) {
+                    if (epoch == restoreEpoch && !awaitingInject) onLayoutReady?.invoke()
+                    return@post
+                }
                 if (epoch == restoreEpoch || epoch == 0) {
+                    reportPageInfo()
                     alpha = 0f
                     visibility = View.VISIBLE
                     animate().cancel()
@@ -651,6 +802,7 @@ private class ReaderAndroidWebView(
         }
 
         restoreEpoch++
+        awaitingInject = false
         val script = when {
             isImageOnly -> buildImageOnlyScript()
             continuousMode -> buildContinuousScript()
@@ -1289,6 +1441,7 @@ private class ReaderAndroidWebView(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isPageCounter) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 touchStartX = event.x
@@ -1400,6 +1553,7 @@ private class ReaderAndroidWebView(
         evaluateJavascript(script) { result ->
             if (result?.trim('"') == "scrolled") {
                 onPageTurned()
+                reportPageInfo()
                 evaluateJavascript(
                     "(function() { return window.hoshiReader.calculateProgress(); })()",
                 ) { progressResult ->
@@ -1462,6 +1616,17 @@ private class ReaderJavascriptBridge(
     fun onImageTapped(imageUrl: String) {
         if (imageUrl.isNotBlank()) onImageTappedCallback.invoke(imageUrl)
     }
+}
+
+/** Parses getPageInfo()'s JSON (delivered as a quoted JS string) into (page, total). */
+private fun parsePageInfo(raw: String?): Pair<Int, Int>? {
+    if (raw == null || raw == "null") return null
+    return runCatching {
+        val json = JSONObject(JSONArray("[$raw]").getString(0))
+        val total = json.getInt("total")
+        if (total < 1) return null
+        json.getInt("page").coerceIn(1, total) to total
+    }.getOrNull()
 }
 
 private fun loadAssetText(context: Context, path: String): String {

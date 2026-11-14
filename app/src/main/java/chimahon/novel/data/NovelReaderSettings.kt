@@ -228,6 +228,19 @@ class NovelReaderSettings(private val context: Context, private val namespace: S
         prefs[keys.READER_SHOW_PROGRESS_TOP] ?: true
     }
 
+    /** Show the whole-book page count (estimated, or exact once counted) in the reader HUD. */
+    val readerShowPageCount: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[keys.READER_SHOW_PAGE_COUNT] ?: true
+    }
+
+    /**
+     * Lay out every section in a hidden view to count exact pages for the
+     * current layout. Off by default: it costs CPU on slow (e-ink) devices.
+     */
+    val readerExactPageCount: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[keys.READER_EXACT_PAGE_COUNT] ?: false
+    }
+
     val enableStatistics: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[keys.ENABLE_STATISTICS] ?: true
     }
@@ -493,6 +506,18 @@ class NovelReaderSettings(private val context: Context, private val namespace: S
         }
     }
 
+    suspend fun setReaderShowPageCount(value: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[keys.READER_SHOW_PAGE_COUNT] = value
+        }
+    }
+
+    suspend fun setReaderExactPageCount(value: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[keys.READER_EXACT_PAGE_COUNT] = value
+        }
+    }
+
     suspend fun setEnableStatistics(value: Boolean) {
         dataStore.edit { prefs ->
             prefs[keys.ENABLE_STATISTICS] = value
@@ -629,6 +654,8 @@ class NovelReaderSettings(private val context: Context, private val namespace: S
         val READER_SHOW_CHARACTERS = booleanKey("reader_show_characters")
         val READER_SHOW_PERCENTAGE = booleanKey("reader_show_percentage")
         val READER_SHOW_PROGRESS_TOP = booleanKey("reader_show_progress_top")
+        val READER_SHOW_PAGE_COUNT = booleanKey("reader_show_page_count")
+        val READER_EXACT_PAGE_COUNT = booleanKey("reader_exact_page_count")
         val ENABLE_STATISTICS = booleanKey("enable_statistics")
         val STATISTICS_AUTOSTART_MODE = stringKey("statistics_autostart_mode")
         val READER_SHOW_READING_SPEED = booleanKey("reader_show_reading_speed")

@@ -253,6 +253,9 @@ class ReaderViewModel(
     var einkRefreshColor by mutableStateOf("BLACK")
     var chapterCacheSizeMb by mutableIntStateOf(100)
     var statisticsAutostartMode by mutableStateOf(StatisticsAutostartMode.OFF)
+    var showPercentage by mutableStateOf(true)
+    var showPageCount by mutableStateOf(true)
+    var exactPageCount by mutableStateOf(false)
 
     // All mutable state lives above init: init assignments can never hit a null delegate.
     // Same key the manga reader uses; null when the store is unreachable.
@@ -293,6 +296,194 @@ class ReaderViewModel(
 
     val currentChapterEndCharacter: Int
         get() = accumulatedCharCounts.getOrDefault(index + 1, 0)
+
+    /** Source novels: counts fill per chapter as read, so whole-book totals aren't known. */
+    val isVirtualBook: Boolean
+        get() = document.extractedDir == null && document.zipPath.isBlank()
+
+    /**
+     * Whole-book progress (0..1) by characters, as calibre/Boox show it.
+     * Null until the prefix sums are ready, and always for virtual books.
+     * Display-only: [currentProgress] stays per-section for bookmarks and sync.
+     */
+    val bookProgress: Double?
+        get() {
+            if (isVirtualBook) return null
+            val total = totalCharacters
+            val base = accumulatedCharCounts[index]
+            val next = accumulatedCharCounts[index + 1]
+            if (total <= 0 || base == null || next == null) return null
+            return ((base + (next - base) * currentProgress) / total).coerceIn(0.0, 1.0)
+        }
+
+    // ── Page counts ──
+    // The visible WebView reports the current section's screen pages; other
+    // sections are estimated from a measured chars-per-page ratio, or counted
+    // exactly in a hidden WebView when [exactPageCount] is on.
+
+    /** 1-based page within the current section, and its page total (0 = not reported yet). */
+    var sectionPage by mutableIntStateOf(0)
+        private set
+    var sectionPageTotal by mutableIntStateOf(0)
+        private set
+    private var sectionPageIndex by mutableIntStateOf(-1)
+
+    private var charsPerPage by mutableStateOf<Double?>(null)
+
+    var pageLayoutKey by mutableStateOf<PageLayoutKey?>(null)
+        private set
+    private val exactPageCounts = androidx.compose.runtime.mutableStateMapOf<Int, Int>()
+    private val failedPageCounts = androidx.compose.runtime.mutableStateMapOf<Int, Boolean>()
+    private var lastReaderActivityMs = 0L
+
+    private fun sectionChars(i: Int): Int {
+        val start = accumulatedCharCounts[i] ?: return 0
+        val end = accumulatedCharCounts[i + 1] ?: return 0
+        return (end - start).coerceAtLeast(0)
+    }
+
+    private fun isSectionImageOnly(i: Int): Boolean =
+        document.linearSpineItems.getOrNull(i)?.type == SpineItemType.IMAGE_ONLY
+
+    /** Whole-book page position, or null until enough is known to show one. */
+    val bookPagePosition: BookPagePosition?
+        get() {
+            if (isVirtualBook || totalCharacters <= 0 || sectionPageIndex != index) return null
+            return computeBookPages(
+                sectionCount = document.linearSpineItems.size,
+                currentIndex = index,
+                currentPage = sectionPage,
+                currentTotal = sectionPageTotal,
+                exactCounts = exactPageCounts,
+                sectionChars = ::sectionChars,
+                isImageOnly = ::isSectionImageOnly,
+                charsPerPage = charsPerPage ?: ratioFromCountedSections(),
+            )
+        }
+
+    /** Fallback ratio (e.g. reader opened on a cover page) from sections already counted. */
+    private fun ratioFromCountedSections(): Double? {
+        var chars = 0
+        var pages = 0
+        exactPageCounts.forEach { (i, count) ->
+            val c = sectionChars(i)
+            if (measureCharsPerPage(c, count) != null) {
+                chars += c
+                pages += count
+            }
+        }
+        return measureCharsPerPage(chars, pages)
+    }
+
+    /** Text for the reader HUD, honouring the percentage/page-count display settings. */
+    val progressDisplayText: String
+        get() {
+            val parts = mutableListOf<String>()
+            if (isVirtualBook) {
+                // Book totals are unknown here: chapter-relative values only.
+                if (showPercentage) parts += "Ch ${index + 1}/$chapterCount · ${(currentProgress * 100).toInt()}%"
+                if (showPageCount && sectionPageIndex == index && sectionPageTotal > 0) {
+                    parts += "p. $sectionPage / $sectionPageTotal"
+                }
+                return parts.joinToString(" · ")
+            }
+            if (showPercentage) {
+                parts += "${((bookProgress ?: currentProgress) * 100).toInt()}%"
+            }
+            if (showPageCount) {
+                bookPagePosition?.let { pos ->
+                    parts += if (pos.exact) "${pos.page} / ${pos.total}" else "~${pos.page} / ${pos.total}"
+                }
+            }
+            return parts.joinToString(" · ")
+        }
+
+    /** Called by the visible WebView whenever the current section's page position changes. */
+    fun onSectionPageInfo(page: Int, total: Int) {
+        if (total <= 0) return
+        lastReaderActivityMs = System.currentTimeMillis()
+        sectionPage = page.coerceIn(1, total)
+        sectionPageTotal = total
+        sectionPageIndex = index
+        measureCharsPerPage(sectionChars(index), total)?.let { charsPerPage = it }
+        // The visible section is laid out with the live layout: an exact count for free.
+        // Kept even without exact counting so revisited sections don't drift with the estimate.
+        if (!isVirtualBook && pageLayoutKey != null) {
+            exactPageCounts[index] = total
+        }
+    }
+
+    /** Screen reports its WebView size + layout settings; a change invalidates all counts. */
+    fun updatePageLayout(key: PageLayoutKey?) {
+        if (key == null || key == pageLayoutKey) return
+        pageLayoutKey = key
+        charsPerPage = null
+        exactPageCounts.clear()
+        failedPageCounts.clear()
+        if (exactPageCount && !isVirtualBook) {
+            scope.launch(Dispatchers.IO) { loadPageCountCache(key) }
+        }
+    }
+
+    /** Whether the hidden page counter should be running. */
+    val needsExactPageCount: Boolean
+        get() = exactPageCount && !isVirtualBook && pageLayoutKey != null &&
+            nextSectionToCount() != null
+
+    fun nextSectionToCount(): Int? {
+        val count = document.linearSpineItems.size
+        if (count == 0) return null
+        // Start from the reader's position so nearby pages settle first.
+        return (0 until count).map { (index + it) % count }
+            .firstOrNull { it !in exactPageCounts && it !in failedPageCounts }
+    }
+
+    /** Waits until the reader has been idle briefly, so counting never competes with page turns. */
+    suspend fun awaitReaderIdle() {
+        while (true) {
+            val idleFor = System.currentTimeMillis() - lastReaderActivityMs
+            if (idleFor >= READER_IDLE_MS && chapterTransition == null) return
+            delay((READER_IDLE_MS - idleFor).coerceIn(200L, READER_IDLE_MS))
+        }
+    }
+
+    /** Identity URL + reader-ready HTML for a section, or null if it can't be loaded. */
+    suspend fun pageCountSource(spineIndex: Int): Pair<String, String>? = withContext(Dispatchers.IO) {
+        val url = chapterFileUrl(spineIndex) ?: return@withContext null
+        val html = readPackageFile(spineIndex) ?: return@withContext null
+        url to sanitizeReaderHtml(html)
+    }
+
+    fun isPageCountSectionImageOnly(spineIndex: Int): Boolean = isSectionImageOnly(spineIndex)
+
+    fun onSectionCounted(key: PageLayoutKey, spineIndex: Int, pages: Int?) {
+        if (key != pageLayoutKey) return
+        if (pages == null || pages <= 0) {
+            failedPageCounts[spineIndex] = true
+        } else {
+            exactPageCounts[spineIndex] = pages
+        }
+        if (nextSectionToCount() == null && exactPageCounts.isNotEmpty()) {
+            val snapshot = PageCountCache(key.signature(), exactPageCounts.toMap())
+            scope.launch(Dispatchers.IO) {
+                runCatching { BookStorage.save(snapshot, rootUrl, FileNames.pageCounts) }
+            }
+        }
+    }
+
+    private fun loadPageCountCache(key: PageLayoutKey) {
+        val cache = runCatching { BookStorage.load<PageCountCache>(rootUrl, FileNames.pageCounts) }.getOrNull()
+            ?: return
+        if (cache.signature != key.signature()) return
+        scope.launch {
+            if (pageLayoutKey != key) return@launch
+            cache.counts.forEach { (i, pages) ->
+                if (i in 0 until document.linearSpineItems.size && pages > 0 && i !in exactPageCounts) {
+                    exactPageCounts[i] = pages
+                }
+            }
+        }
+    }
 
     var fullStatistics = mutableStateListOf<Statistics>()
     private var lastPersistTimeMs = System.currentTimeMillis()
@@ -399,6 +590,9 @@ class ReaderViewModel(
             einkRefreshPageInterval = settings.einkRefreshPageInterval.first()
             einkRefreshColor = settings.einkRefreshColor.first()
             statisticsAutostartMode = settings.statisticsAutostartMode.first()
+            showPercentage = settings.readerShowPercentage.first()
+            showPageCount = settings.readerShowPageCount.first()
+            exactPageCount = settings.readerExactPageCount.first()
             // Explicit id wins, else folder lookup for legacy opens (old
             // backstacks, widgets); null = unregistered, sidecar fallback.
             openNovel = openNovelId?.let { id ->
@@ -625,6 +819,23 @@ class ReaderViewModel(
         scope.launch {
             settings.statisticsAutostartMode.collect { statisticsAutostartMode = it }
         }
+        scope.launch {
+            settings.readerShowPercentage.collect { showPercentage = it }
+        }
+        scope.launch {
+            settings.readerShowPageCount.collect { showPageCount = it }
+        }
+        scope.launch {
+            settings.readerExactPageCount.collect { enabled ->
+                val turnedOn = enabled && !exactPageCount
+                exactPageCount = enabled
+                val key = pageLayoutKey
+                if (turnedOn && key != null && !isVirtualBook) {
+                    failedPageCounts.clear()
+                    withContext(Dispatchers.IO) { loadPageCountCache(key) }
+                }
+            }
+        }
     }
 
     fun updateTheme(value: Theme) = scope.launch { settings.setTheme(value) }
@@ -668,6 +879,9 @@ class ReaderViewModel(
     fun updateEinkRefreshColor(value: String) = scope.launch { settings.setEinkRefreshColor(value) }
     fun updateChapterCacheSizeMb(value: Int) = scope.launch { settings.setChapterCacheSizeMb(value) }
     fun updateStatisticsAutostartMode(value: StatisticsAutostartMode) = scope.launch { settings.setStatisticsAutostartMode(value) }
+    fun updateShowPercentage(value: Boolean) = scope.launch { settings.setReaderShowPercentage(value) }
+    fun updateShowPageCount(value: Boolean) = scope.launch { settings.setReaderShowPageCount(value) }
+    fun updateExactPageCount(value: Boolean) = scope.launch { settings.setReaderExactPageCount(value) }
 
     fun onPageTurned() {
         if (statisticsAutostartMode == StatisticsAutostartMode.PAGETURN) {
@@ -1505,5 +1719,6 @@ class ReaderViewModel(
 
     companion object {
         private const val BOOKMARK_PROGRESS_EPSILON = 0.0001
+        private const val READER_IDLE_MS = 1500L
     }
 }

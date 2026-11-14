@@ -665,6 +665,54 @@ fun AppearanceSheet(
                 }
             }
 
+            // Progress display
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Progress", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                ) {
+                    Text("Show percentage", style = MaterialTheme.typography.bodyMedium)
+                    Switch(
+                        checked = viewModel.showPercentage,
+                        onCheckedChange = { viewModel.updateShowPercentage(it) },
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                ) {
+                    Text("Show page count", style = MaterialTheme.typography.bodyMedium)
+                    Switch(
+                        checked = viewModel.showPageCount,
+                        onCheckedChange = { viewModel.updateShowPageCount(it) },
+                    )
+                }
+                if (viewModel.showPageCount && !viewModel.isVirtualBook) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Exact page count", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "Counts every page in the background after layout changes. " +
+                                    "Pages marked ~ are estimates until it finishes. May be slow on e-ink devices.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = viewModel.exactPageCount,
+                            onCheckedChange = { viewModel.updateExactPageCount(it) },
+                        )
+                    }
+                }
+            }
+
             // Storage
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Storage", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
