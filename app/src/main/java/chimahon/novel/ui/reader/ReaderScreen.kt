@@ -77,6 +77,7 @@ fun ReaderScreen(
     var focusMode by remember { mutableStateOf(false) }
     var activeSheet by remember { mutableStateOf<ActiveSheet?>(null) }
     var tappedImageUri by remember { mutableStateOf<String?>(null) }
+    val textSelection = remember { ReaderTextSelectionController() }
     val scope = rememberCoroutineScope()
     val settings = remember(settingsNamespace) { chimahon.novel.data.NovelReaderSettings(context, settingsNamespace) }
 
@@ -402,6 +403,7 @@ fun ReaderScreen(
                         onScrollMoved = { if (viewModel.einkRefreshOnScroll) einkRefreshHost.triggerScroll() },
                         onImageTapped = { uri -> tappedImageUri = uri },
                         onPageInfoChanged = viewModel::onSectionPageInfo,
+                        textSelection = textSelection,
                     )
 
                     if (viewModel.einkRefreshOnPageTurn || viewModel.einkRefreshOnScroll) {
@@ -492,6 +494,18 @@ fun ReaderScreen(
                     onOpenStatistics = { activeSheet = ActiveSheet.Statistics },
                 )
             }
+
+            // Handles and action bar for the reader's own text selection
+            ReaderTextSelectionOverlay(
+                controller = textSelection,
+                backgroundColor = Color(currentSettings.backgroundColor),
+                contentColor = Color(currentSettings.textColor),
+            )
+        }
+
+        // A sheet or image viewer covers the page the selection belongs to.
+        LaunchedEffect(activeSheet, tappedImageUri) {
+            if (activeSheet != null || tappedImageUri != null) textSelection.clear()
         }
 
         // Sheets outside the Box - true overlay that doesn't affect WebView size

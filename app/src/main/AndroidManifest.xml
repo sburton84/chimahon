@@ -63,6 +63,12 @@
     <queries>
         <package android:name="com.ichi2.anki" />
         <package android:name="io.github.pedrubik2000.kuma3" />
+        <!-- Novel reader text selection: "process text" apps (e.g. translators) and direct share to Claude -->
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <package android:name="com.anthropic.claude" />
     </queries>
 
     <application

@@ -63,6 +63,8 @@ fun ReaderWebView(
     onScrollMoved: () -> Unit = {},
     onImageTapped: (imageUrl: String) -> Unit = {},
     onPageInfoChanged: (page: Int, total: Int) -> Unit = { _, _ -> },
+    /** When set, long press selects text with the reader's own selection instead of Chromium's. */
+    textSelection: ReaderTextSelectionController? = null,
 ) {
     val pendingCommands = remember(bridge) { bridge.pendingCommands }
 
@@ -124,6 +126,7 @@ fun ReaderWebView(
                 onScrollMoved = onScrollMoved,
                 onImageTappedCallback = onImageTapped,
                 onPageInfoChanged = onPageInfoChanged,
+                textSelection = textSelection,
             ).apply {
                 setSelectionRectsCallback(onSelectionRectsReceived)
                 installReaderClients(onInternalLinkClicked, onLoadFailed)
@@ -497,7 +500,8 @@ private class ReaderAndroidWebView(
     private val onPageInfoChanged: (page: Int, total: Int) -> Unit = { _, _ -> },
     /** Hidden layout-only instance: never shown, never takes touches. */
     val isPageCounter: Boolean = false,
-) : WebView(context) {
+    private val textSelection: ReaderTextSelectionController? = null,
+) : WebView(context), TextSelectionHost {
 
     /** Page-counter hooks (UI thread): section laid out and restored, or failed to load. */
     var onLayoutReady: (() -> Unit)? = null
@@ -552,6 +556,9 @@ private class ReaderAndroidWebView(
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
         super.onScrollChanged(l, t, oldl, oldt)
 
+        // The selection's handles and bar are placed for the old position.
+        clearSelectionIfShown()
+
         if (isPopupActive) {
             onDismissPopupRequested()
         }
@@ -577,6 +584,10 @@ private class ReaderAndroidWebView(
         context,
         object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(event: MotionEvent): Boolean = true
+
+            override fun onLongPress(event: MotionEvent) {
+                startSelectionGesture(event)
+            }
 
             override fun onFling(
                 e1: MotionEvent?,
@@ -663,6 +674,139 @@ private class ReaderAndroidWebView(
         setLayerType(LAYER_TYPE_HARDWARE, null)
         addJavascriptInterface(jsBridge, "ReaderAndroid")
         setBackgroundColor(readerSettings.backgroundColor)
+        if (textSelection != null && !isPageCounter) {
+            // Consuming the long click stops Chromium starting its own
+            // selection, with its magnifier and floating menu.
+            setOnLongClickListener { true }
+            isLongClickable = false
+            isHapticFeedbackEnabled = false
+            textSelection.host = this
+        }
+    }
+
+    // ─── Reader-drawn text selection (see ReaderTextSelection.kt) ─────────────
+
+    /** The long-pressing finger is down and drags the selection's end. */
+    private var selectionGestureActive = false
+
+    /** This touch began while a selection was showing: a tap only dismisses it. */
+    private var tapDismissesSelection = false
+
+    private var selectionCallInFlight = false
+    private var pendingSelectionScript: String? = null
+
+    /** Bumped on clear, so results of scripts sent before it are dropped. */
+    private var selectionGeneration = 0
+
+    private fun startSelectionGesture(event: MotionEvent) {
+        val selection = textSelection ?: return
+        if (isPageCounter || isImageOnly) return
+        if (isPopupActive) onDismissPopupRequested()
+
+        selectionGestureActive = true
+        selection.barAtTopHint = event.y > height / 2f
+        selection.dragging = SelectionDragTarget.FOCUS
+        performHapticFeedback(
+            android.view.HapticFeedbackConstants.LONG_PRESS,
+            android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING,
+        )
+        // The WebView saw this touch go down; cancel it so it doesn't scroll
+        // or act on the rest of the gesture.
+        val cancel = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
+        super.onTouchEvent(cancel)
+        cancel.recycle()
+
+        val density = resources.displayMetrics.density
+        runSelectionScript("window.hoshiReader.userSelectionBegin(${event.x / density}, ${event.y / density})")
+    }
+
+    override fun extendSelection(target: SelectionDragTarget, windowX: Float, windowY: Float) {
+        val loc = IntArray(2)
+        getLocationInWindow(loc)
+        val density = resources.displayMetrics.density
+        val x = (windowX - loc[0]) / density
+        val y = (windowY - loc[1]) / density
+        runSelectionScript("window.hoshiReader.userSelectionExtend($x, $y, '${target.js}')")
+    }
+
+    override fun clearSelection() {
+        selectionGeneration++
+        pendingSelectionScript = null
+        textSelection?.state = null
+        evaluateJavascript("if (window.hoshiReader && window.hoshiReader.userSelectionClear) { window.hoshiReader.userSelectionClear(); }", null)
+    }
+
+    override fun lookUpSelection() {
+        selectionGeneration++
+        pendingSelectionScript = null
+        textSelection?.state = null
+        // Reports back through onTextSelected, like a tap on the first character.
+        evaluateJavascript("if (window.hoshiReader && window.hoshiReader.userSelectionLookup) { window.hoshiReader.userSelectionLookup(); }", null)
+    }
+
+    private fun clearSelectionIfShown() {
+        val selection = textSelection ?: return
+        if (selection.state != null || selectionGestureActive) {
+            selectionGestureActive = false
+            selection.dragging = null
+            clearSelection()
+        }
+    }
+
+    /**
+     * Runs one selection script at a time. Drags produce moves faster than the
+     * page answers, so while one runs only the latest waiting script is kept.
+     */
+    private fun runSelectionScript(script: String) {
+        if (selectionCallInFlight) {
+            pendingSelectionScript = script
+            return
+        }
+        selectionCallInFlight = true
+        val generation = selectionGeneration
+        evaluateJavascript("(function() { try { return $script; } catch (e) { return null; } })()") { result ->
+            selectionCallInFlight = false
+            if (generation == selectionGeneration) applySelectionResult(result)
+            pendingSelectionScript?.let {
+                pendingSelectionScript = null
+                runSelectionScript(it)
+            }
+        }
+    }
+
+    private fun applySelectionResult(result: String?) {
+        val selection = textSelection ?: return
+        if (result == null || result == "null") {
+            selection.state = null
+            return
+        }
+        val json = runCatching { JSONObject(result) }.getOrNull() ?: return
+        val loc = IntArray(2)
+        getLocationInWindow(loc)
+        val density = resources.displayMetrics.density
+        fun rect(name: String): androidx.compose.ui.geometry.Rect? {
+            val obj = json.optJSONObject(name) ?: return null
+            val left = obj.getDouble("x").toFloat() * density + loc[0]
+            val top = obj.getDouble("y").toFloat() * density + loc[1]
+            return androidx.compose.ui.geometry.Rect(
+                left,
+                top,
+                left + obj.getDouble("width").toFloat() * density,
+                top + obj.getDouble("height").toFloat() * density,
+            )
+        }
+        val text = json.optString("text")
+        if (text.isEmpty()) {
+            selection.state = null
+            return
+        }
+        selection.state = TextSelectionState(
+            text = text,
+            vertical = json.optBoolean("vertical"),
+            start = rect("start"),
+            end = rect("end"),
+            bounds = rect("bounds"),
+        )
     }
 
     /** Set callback for selection rects from JS (used by Compose highlight overlay). */
@@ -779,6 +923,7 @@ private class ReaderAndroidWebView(
         appendLine("html, body { margin: 0 !important; padding: 0 !important; }")
         appendLine("html { -webkit-line-box-contain: block glyphs replaced; }")
         appendLine("::highlight(hoshi-selection) { background-color: rgba(130, 150, 200, 0.4); color: inherit; }")
+        appendLine("::highlight(hoshi-user-selection) { background-color: rgba(90, 120, 200, 0.45); color: inherit; }")
         appendLine("p { margin-block-start: 0 !important; margin-block-end: ${readerSettings.paragraphSpacing}em !important; }")
         appendLine("body * { font-family: inherit !important; }")
         appendLine("img.block-img, svg.block-img { position: static !important; }")
@@ -804,6 +949,11 @@ private class ReaderAndroidWebView(
 
         restoreEpoch++
         awaitingInject = false
+        clearSelectionIfShown()
+        // A script sent to the previous page may never call back.
+        selectionGeneration++
+        selectionCallInFlight = false
+        pendingSelectionScript = null
         val script = when {
             isImageOnly -> buildImageOnlyScript()
             continuousMode -> buildContinuousScript()
@@ -1074,6 +1224,7 @@ private class ReaderAndroidWebView(
                 document.documentElement.style.setProperty('height', 'auto', 'important');
 
                 window.hoshiReader.registerCopyText();
+                window.hoshiReader.registerUserSelection();
                 window.hoshiReader.continuousMode = true;
 
                 var allMediaCont = Array.from(document.querySelectorAll('img, svg'));
@@ -1295,6 +1446,7 @@ private class ReaderAndroidWebView(
                 b.style.setProperty('overflow', 'hidden', 'important');
 
                 window.hoshiReader.registerCopyText();
+                window.hoshiReader.registerUserSelection();
 
                 var allMediaPaged = Array.from(document.querySelectorAll('img, svg'));
                 var imagePromises = allMediaPaged.map(function(el) {
@@ -1349,6 +1501,7 @@ private class ReaderAndroidWebView(
     }
 
     fun applySettings(settings: ReaderSettings) {
+        clearSelectionIfShown()
         if (settings.continuousMode != continuousMode) {
             continuousMode = settings.continuousMode
             currentUrl?.let { url ->
@@ -1443,11 +1596,28 @@ private class ReaderAndroidWebView(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (isPageCounter) return false
+        if (selectionGestureActive) {
+            // After a long press the finger drags the selection's end until it lifts.
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> {
+                    val loc = IntArray(2)
+                    getLocationInWindow(loc)
+                    extendSelection(SelectionDragTarget.FOCUS, event.x + loc[0], event.y + loc[1])
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    selectionGestureActive = false
+                    textSelection?.dragging = null
+                }
+            }
+            gestureDetector.onTouchEvent(event)
+            return true
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 touchStartX = event.x
                 touchStartY = event.y
                 totalMovement = 0f
+                tapDismissesSelection = textSelection?.state != null
             }
             MotionEvent.ACTION_MOVE -> {
                 totalMovement += kotlin.math.abs(event.x - touchStartX) + kotlin.math.abs(event.y - touchStartY)
@@ -1458,7 +1628,9 @@ private class ReaderAndroidWebView(
                 // A long press starts native text selection; treating its release as a tap
                 // would turn the page or toggle the HUD at the edges and dismiss the menu.
                 val isLongPress = event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout()
-                if (totalMovement < 20f && !isLongPress) {
+                if (totalMovement < 20f && !isLongPress && tapDismissesSelection) {
+                    clearSelectionIfShown()
+                } else if (totalMovement < 20f && !isLongPress) {
                     val cssX = event.x / resources.displayMetrics.density
                     val cssY = event.y / resources.displayMetrics.density
                     evaluateJavascript(
@@ -1477,6 +1649,7 @@ private class ReaderAndroidWebView(
     override fun performClick(): Boolean = super.performClick()
 
     fun paginate(forward: Boolean) {
+        clearSelectionIfShown()
         if (forward) {
             navigate("forward", onNextChapter)
         } else {
@@ -1485,6 +1658,7 @@ private class ReaderAndroidWebView(
     }
 
     private fun handleSwipe(forward: Boolean): Boolean {
+        clearSelectionIfShown()
         return when {
             isImageOnly -> {
                 // Image-only chapter = single page, any swipe changes chapter
