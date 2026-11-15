@@ -485,10 +485,17 @@ window.hoshiReader = {
     },
 
     copySelectionText: function(selection) {
+        const ranges = [];
+        for (let i = 0; i < selection.rangeCount; i++) ranges.push(selection.getRangeAt(i));
+        return this.rangesText(ranges, selection.toString());
+    },
+
+    /** Plain text of [ranges] without furigana; [fallback], if given, is used when no ruby is involved. */
+    rangesText: function(ranges, fallback) {
         const fragments = [];
         let hasRuby = false;
-        for (let i = 0; i < selection.rangeCount; i++) {
-            const range = selection.getRangeAt(i);
+        for (let i = 0; i < ranges.length; i++) {
+            const range = ranges[i];
             if (this.isFurigana(range.commonAncestorContainer)) {
                 hasRuby = true;
                 continue;
@@ -498,7 +505,9 @@ window.hoshiReader = {
             fragment.querySelectorAll('rt, rp').forEach(node => node.remove());
             fragments.push(fragment);
         }
-        if (!hasRuby) return selection.toString();
+        // Range.toString() would run paragraphs together, so without a
+        // selection's own text the block-aware path below is used.
+        if (!hasRuby && fallback !== undefined) return fallback;
 
         const blocks = new Set(['P', 'DIV', 'SECTION', 'ARTICLE', 'LI', 'BLOCKQUOTE',
             'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TR']);
@@ -559,7 +568,8 @@ window.hoshiReader = {
         return start < text.length ? start + String.fromCodePoint(text.codePointAt(start)).length : start;
     },
 
-    getCharacterAtPoint: function(x, y) {
+    /** The character under (x, y); punctuation and spaces only when [allowBoundary] (text selection). */
+    getCharacterAtPoint: function(x, y, allowBoundary) {
         const range = this.getCaretRange(x, y);
         if (!range || !range.startContainer) return null;
         const node = range.startContainer;
@@ -629,7 +639,9 @@ window.hoshiReader = {
                 }
             }
         }
-        return best && !this.isScanBoundary(String.fromCodePoint(best.node.textContent.codePointAt(best.offset))) ? best : null;
+        if (!best) return null;
+        if (allowBoundary) return best;
+        return !this.isScanBoundary(String.fromCodePoint(best.node.textContent.codePointAt(best.offset))) ? best : null;
     },
 
     getSentence: function(startNode, startOffset) {
@@ -950,7 +962,215 @@ window.hoshiReader = {
         this.selectionStartOffset = null;
     },
 
-    registerTextSelection: function() {
-        // Disabled for now as per user request
+    // ─── Reader-drawn text selection ──────────────────────────────────────────
+    // Chromium's own selection shows Android's magnifier, a fixed horizontal
+    // strip that slices vertical text into fragments of neighbouring columns.
+    // The reader suppresses it and draws its own selection instead: native
+    // code drives these functions from long-press, drag and handle gestures,
+    // and each returns the selection state for the native overlay to draw.
+    // Points are { node, offset } boundaries in non-furigana text nodes.
+
+    userSelection: null,
+
+    registerUserSelection: function() {
+        if (window._hoshiUserSelection) return;
+        window._hoshiUserSelection = true;
+        // Belt and braces with the WebView's disabled long-click: never let
+        // a native selection (and its magnifier and menu) start.
+        document.addEventListener('selectstart', function(e) { e.preventDefault(); }, true);
+        document.addEventListener('contextmenu', function(e) { e.preventDefault(); }, true);
+    },
+
+    comparePoints: function(a, b) {
+        if (a.node === b.node) return a.offset - b.offset;
+        return (a.node.compareDocumentPosition(b.node) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
+    },
+
+    /** The character under (x, y) as { node, before, after } boundaries, or the caret there when between characters. */
+    userSelectionPointAt: function(x, y) {
+        const hit = this.getCharacterAtPoint(x, y, true);
+        if (hit) {
+            return { node: hit.node, before: hit.offset, after: this.nextCodePointOffset(hit.node.textContent, hit.offset) };
+        }
+        const caret = this.getCaretRange(x, y);
+        if (!caret || !caret.startContainer || caret.startContainer.nodeType !== Node.TEXT_NODE) return null;
+        if (this.isFurigana(caret.startContainer)) return null;
+        return { node: caret.startContainer, before: caret.startOffset, after: caret.startOffset };
+    },
+
+    /** Word containing [offset] in [node] (a single character when segmentation is unavailable). */
+    wordAround: function(node, offset) {
+        const text = node.textContent;
+        const start = this.codePointStartOffset(text, offset);
+        const end = this.nextCodePointOffset(text, start);
+        if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+            try {
+                const segmenter = new Intl.Segmenter(document.documentElement.lang || 'ja', { granularity: 'word' });
+                for (const segment of segmenter.segment(text)) {
+                    if (start >= segment.index && start < segment.index + segment.segment.length) {
+                        if (segment.isWordLike) {
+                            return { start: segment.index, end: segment.index + segment.segment.length };
+                        }
+                        break;
+                    }
+                }
+            } catch (_) {}
+        }
+        return { start: start, end: end };
+    },
+
+    /** Starts a selection on the word under (x, y). */
+    userSelectionBegin: function(x, y) {
+        this.userSelectionClear();
+        const point = this.userSelectionPointAt(x, y);
+        if (!point || point.after === point.before) return null;
+        const word = this.wordAround(point.node, point.before);
+        const start = { node: point.node, offset: word.start };
+        const end = { node: point.node, offset: word.end };
+        this.userSelection = { start: start, end: end, anchorStart: start, anchorEnd: end };
+        return this.userSelectionUpdate();
+    },
+
+    /**
+     * Moves one end of the selection to the character under (x, y).
+     * [which] is 'focus' while the long-pressing finger drags (the first word
+     * stays selected and the other end follows the finger), or 'start'/'end'
+     * for the handles. Ends never cross; a move that would is ignored.
+     */
+    userSelectionExtend: function(x, y, which) {
+        const sel = this.userSelection;
+        if (!sel) return which === 'focus' ? this.userSelectionBegin(x, y) : null;
+        const point = this.userSelectionPointAt(x, y);
+        if (!point) return this.userSelectionState();
+        const before = { node: point.node, offset: point.before };
+        const after = { node: point.node, offset: point.after };
+        if (which === 'focus') {
+            if (this.comparePoints(before, sel.anchorStart) < 0) {
+                sel.start = before;
+                sel.end = sel.anchorEnd;
+            } else {
+                sel.start = sel.anchorStart;
+                sel.end = this.comparePoints(after, sel.anchorEnd) > 0 ? after : sel.anchorEnd;
+            }
+        } else if (which === 'start') {
+            if (this.comparePoints(before, sel.end) < 0) sel.start = before;
+        } else if (which === 'end') {
+            if (this.comparePoints(after, sel.start) > 0) sel.end = after;
+        }
+        return this.userSelectionUpdate();
+    },
+
+    userSelectionRange: function() {
+        const sel = this.userSelection;
+        if (!sel) return null;
+        try {
+            const range = document.createRange();
+            range.setStart(sel.start.node, sel.start.offset);
+            range.setEnd(sel.end.node, sel.end.offset);
+            return range;
+        } catch (_) {
+            return null;
+        }
+    },
+
+    userSelectionUpdate: function() {
+        const range = this.userSelectionRange();
+        if (!range || range.collapsed) {
+            this.userSelectionClear();
+            return null;
+        }
+        if (typeof CSS !== 'undefined' && CSS.highlights) {
+            CSS.highlights.set('hoshi-user-selection', new Highlight(range));
+        }
+        return this.userSelectionState();
+    },
+
+    /** Box of the first character at or after [point] (forward), or the last one before it. */
+    edgeCharRect: function(point, forward) {
+        const walker = this.createWalker(document.body);
+        let node = point.node;
+        let offset = point.offset;
+        walker.currentNode = node;
+        while (node) {
+            const text = node.textContent;
+            while (forward ? offset < text.length : offset > 0) {
+                const start = this.codePointStartOffset(text, forward ? offset : offset - 1);
+                const end = this.nextCodePointOffset(text, start);
+                const range = document.createRange();
+                range.setStart(node, start);
+                range.setEnd(node, end);
+                const rect = range.getClientRects()[0];
+                if (rect && rect.width > 0 && rect.height > 0) return rect;
+                offset = forward ? end : start;
+            }
+            node = forward ? walker.nextNode() : walker.previousNode();
+            if (node) offset = forward ? 0 : node.textContent.length;
+        }
+        return null;
+    },
+
+    /** The selection for the native overlay, in CSS pixels relative to the viewport. */
+    userSelectionState: function() {
+        const sel = this.userSelection;
+        const range = this.userSelectionRange();
+        if (!sel || !range) return null;
+        const toJson = function(rect) {
+            return rect ? { x: rect.left, y: rect.top, width: rect.width, height: rect.height } : null;
+        };
+        const startRect = this.edgeCharRect(sel.start, true);
+        const endRect = this.edgeCharRect(sel.end, false);
+        return {
+            text: this.rangesText([range]),
+            vertical: getComputedStyle(sel.start.node.parentElement).writingMode.startsWith('vertical'),
+            start: toJson(startRect),
+            end: toJson(endRect),
+            bounds: toJson(range.getBoundingClientRect()),
+        };
+    },
+
+    userSelectionClear: function() {
+        this.userSelection = null;
+        if (typeof CSS !== 'undefined' && CSS.highlights) CSS.highlights.delete('hoshi-user-selection');
+    },
+
+    /** Hands the selection to the dictionary as if its first character had been tapped. */
+    userSelectionLookup: function() {
+        const sel = this.userSelection;
+        if (!sel) return false;
+        const ranges = [];
+        const walker = this.createWalker(document.body);
+        walker.currentNode = sel.start.node;
+        let node = sel.start.node;
+        while (node) {
+            const start = node === sel.start.node ? sel.start.offset : 0;
+            const end = node === sel.end.node ? sel.end.offset : node.textContent.length;
+            if (end > start) ranges.push({ node: node, start: start, end: end });
+            if (node === sel.end.node) break;
+            node = walker.nextNode();
+        }
+        // Leading spaces would shift the dictionary match against the ranges.
+        while (ranges.length) {
+            const first = ranges[0];
+            while (first.start < first.end && /[\s　]/.test(first.node.textContent[first.start])) first.start++;
+            if (first.start < first.end) break;
+            ranges.shift();
+        }
+        if (!ranges.length) return false;
+        const word = ranges.map(r => r.node.textContent.slice(r.start, r.end)).join('');
+        const first = ranges[0];
+        const rect = this.edgeCharRect({ node: first.node, offset: first.start }, true);
+        if (!rect) return false;
+
+        this.userSelectionClear();
+        this.clearSelection();
+        this.selectionStartNode = first.node;
+        this.selectionStartOffset = first.start;
+        this.selectionRanges = ranges;
+        const sentence = this.getSentence(first.node, first.start);
+        if (window.ReaderAndroid && window.ReaderAndroid.onTextSelected) {
+            window.ReaderAndroid.onTextSelected(word, sentence, rect.left, rect.top, rect.width, rect.height);
+            return true;
+        }
+        return false;
     }
 };
