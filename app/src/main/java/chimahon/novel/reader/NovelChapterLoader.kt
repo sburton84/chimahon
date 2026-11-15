@@ -12,6 +12,7 @@ import eu.kanade.tachiyomi.sourcenovel.model.SNChapter
 import eu.kanade.tachiyomi.sourcenovel.model.SNNovel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import tachiyomi.domain.novel.model.Novel
 import tachiyomi.domain.novel.model.toSNNovel
 import tachiyomi.domain.novel.repository.NovelChapterRepository
 import tachiyomi.domain.novel.repository.NovelRepository
@@ -100,7 +101,7 @@ class NovelChapterLoader(
         if (novelId != null) {
             val dbNovel = runCatching { novelRepository.getNovelById(novelId) }.getOrNull() ?: return null
             // Local books read their EPUB files directly.
-            if (dbNovel.isLocal) return null
+            if (dbNovel.isLocal || dbNovel.source == Novel.LOCAL_SOURCE_ID) return null
             val source = sourceManager.getNovelSource(dbNovel.source) ?: return null
             val row = novelChapterRepository.getChaptersByNovelId(dbNovel.id)
                 .sortedBy { it.chapterNumber }
@@ -135,7 +136,7 @@ class NovelChapterLoader(
         // Fallback: library novels resolve through the DB in reading order.
         val novelUrl = metadata.novelUrl ?: return null
         val dbNovel = novelRepository.getNovelByUrlAndSourceId(novelUrl, sourceId) ?: return null
-        if (dbNovel.isLocal) return null
+        if (dbNovel.isLocal || dbNovel.source == Novel.LOCAL_SOURCE_ID) return null
         val row = novelChapterRepository.getChaptersByNovelId(dbNovel.id)
             .sortedBy { it.chapterNumber }
             .getOrNull(spineIndex) ?: return null

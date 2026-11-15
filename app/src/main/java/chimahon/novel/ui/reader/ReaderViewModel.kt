@@ -185,7 +185,9 @@ class ReaderLoaderViewModel(
                         runCatching { novelRepository.getNovelByUrlAndSourceId(novelUrl, sourceId) }.getOrNull()
                     } ?: return@runBlocking null
                 // Local books always file-parse (their identity is the folder).
-                if (novel.isLocal) return@runBlocking null
+                // Source id counts too: source-novel backup entries for local
+                // books restore with isLocal unset but the local source id.
+                if (novel.isLocal || novel.source == Novel.LOCAL_SOURCE_ID) return@runBlocking null
                 val chapters = novelChapterRepository.getChaptersByNovelId(novel.id)
                     .sortedBy { it.chapterNumber }
                     .takeIf { it.isNotEmpty() } ?: return@runBlocking null
