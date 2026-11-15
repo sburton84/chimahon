@@ -84,6 +84,22 @@ class NovelLibraryScreenModel(
     }
 
     /** Row id for a local folder (reader identity threading); null when unregistered. */
+    /**
+     * A file-path cover that can't be read here: restored backups carry paths
+     * into another install's private storage (e.g. a release build's
+     * `/data/user/0/app.chimahon/...` restored into a beta), which render as
+     * placeholders until re-derived from the book's EPUB.
+     */
+    private fun isUnreadableFileCover(thumbnailUrl: String?): Boolean {
+        val path = when {
+            thumbnailUrl.isNullOrBlank() -> return false
+            thumbnailUrl.startsWith("file://") -> android.net.Uri.parse(thumbnailUrl).path
+            thumbnailUrl.startsWith("/") -> thumbnailUrl
+            else -> return false
+        } ?: return true
+        return !runCatching { java.io.File(path).canRead() }.getOrDefault(false)
+    }
+
     suspend fun getLocalNovelId(folder: String): Long? {
         return runCatching { novelRepository.getNovelByLocalFolder(folder)?.id }.getOrNull()
     }
@@ -176,7 +192,7 @@ class NovelLibraryScreenModel(
                     val registrar = Injekt.get<RegisterLocalNovelHome>()
                     val epubFolders = chimahon.novel.source.LocalNovelFiles.foldersWithEpub(app)
                     val coverless = localRows
-                        .filter { it.thumbnailUrl.isNullOrBlank() }
+                        .filter { it.thumbnailUrl.isNullOrBlank() || isUnreadableFileCover(it.thumbnailUrl) }
                         .mapNotNull { it.localFolder?.takeIf { f -> f.isNotBlank() } }
                         .toSet()
                     books.filter {

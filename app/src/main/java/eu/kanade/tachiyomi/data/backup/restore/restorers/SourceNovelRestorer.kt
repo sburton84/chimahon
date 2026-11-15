@@ -32,6 +32,11 @@ class SourceNovelRestorer(
     }
 
     suspend fun restore(backupNovel: BackupSourceNovel) {
+        // Local books are restored from backupNovels (NovelRestorer), which
+        // keys them by title folder. Their source-list twin carries the
+        // writer's URL scheme (older builds: local://<hash>), so restoring it
+        // here would add a duplicate row without isLocal.
+        if (backupNovel.source == Novel.LOCAL_SOURCE_ID) return
         val dbNovel = novelRepository.getNovelByUrlAndSourceId(backupNovel.url, backupNovel.source)
         val restoredNovel = if (dbNovel == null) {
             restoreNewNovel(backupNovel.getNovelImpl())
