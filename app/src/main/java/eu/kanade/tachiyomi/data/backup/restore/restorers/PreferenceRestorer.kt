@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.data.backup.restore.restorers
 
 import android.content.Context
+import chimahon.novel.data.NovelReaderSettingsBackup
 import eu.kanade.domain.source.service.SourcePreferences
 import eu.kanade.tachiyomi.data.backup.create.BackupCreateJob
 import eu.kanade.tachiyomi.data.backup.models.BackupCategory
@@ -41,8 +42,19 @@ class PreferenceRestorer(
         backupCategories: List<BackupCategory>?,
         backupAnimeCategories: List<BackupCategory>? = null,
     ) {
+        // Chimahon -->
+        // Novel reader settings live in their own DataStore, not the app store.
+        val (readerSettings, appPreferences) = preferences.partition {
+            NovelReaderSettingsBackup.isReaderSettingKey(it.key)
+        }
+        try {
+            NovelReaderSettingsBackup.restore(context, readerSettings)
+        } catch (e: Exception) {
+            xLogE("Failed to restore novel reader settings", e)
+        }
+        // Chimahon <--
         restorePreferences(
-            preferences,
+            appPreferences,
             preferenceStore,
             backupCategories,
             backupAnimeCategories,

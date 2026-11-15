@@ -231,7 +231,10 @@ class BackupCreator(
     /* KMK --> */ suspend /* KMK <-- */ fun backupAppPreferences(options: BackupOptions): List<BackupPreference> {
         if (!options.appSettings) return emptyList()
 
-        return preferenceBackupCreator.createApp(includePrivatePreferences = options.privateSettings)
+        return preferenceBackupCreator.createApp(includePrivatePreferences = options.privateSettings) +
+            // Chimahon -->
+            chimahon.novel.data.NovelReaderSettingsBackup.create(context)
+        // Chimahon <--
     }
 
     internal suspend fun backupExtensionStores(options: BackupOptions): List<BackupExtensionStore> {
